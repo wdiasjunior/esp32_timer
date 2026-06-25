@@ -26,10 +26,11 @@ WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
 Preferences  prefs;
 
-Mode      currentMode    = MODE_OFF;
-bool      relayState     = false;
-bool      timeSynced     = false;
-uint8_t   scheduleCount  = 0;
+Mode      currentMode        = MODE_OFF;
+bool      relayState         = false;
+bool      timeSynced         = false;
+bool      autoRevertToAuto   = false; // ON set outside schedule → revert to AUTO when schedule starts
+uint8_t   scheduleCount      = 0;
 TimeRange schedules[MAX_SCHEDULES];
 
 unsigned long lastStatePublish = 0;
@@ -85,6 +86,18 @@ void loadSchedules() {
         schedules[0] = {7, 0, 23, 0};
         scheduleCount = 1;
     }
+}
+
+void saveAutoRevert() {
+    prefs.begin("timer", false);
+    prefs.putBool("autoRev", autoRevertToAuto);
+    prefs.end();
+}
+
+void loadAutoRevert() {
+    prefs.begin("timer", true);
+    autoRevertToAuto = prefs.getBool("autoRev", false);
+    prefs.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +312,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (newMode != currentMode) {
             currentMode = newMode;
             saveMode();
-            Serial.printf("Mode changed to %s\n", modeToString(currentMode));
+
+            // Track if ON was set outside schedule for auto-revert
+            if (newMode == MODE_ON && timeSynced && !isInSchedule()) {
+                autoRevertToAuto = true;
+            } else {
+                autoRevertToAuto = false;
+            }
+            saveAutoRevert();
+
+            Serial.printf("Mode changed to %s (autoRevert=%d)\n",
+                          modeToString(currentMode), autoRevertToAuto);
         }
         publishModeState();
     }
@@ -407,8 +430,9 @@ void setup() {
     // Load saved state
     loadMode();
     loadSchedules();
-    Serial.printf("Loaded mode: %s, schedules: %s\n",
-                  modeToString(currentMode), scheduleToString().c_str());
+    loadAutoRevert();
+    Serial.printf("Loaded mode: %s, schedules: %s, autoRevert: %d\n",
+                  modeToString(currentMode), scheduleToString().c_str(), autoRevertToAuto);
 
     // Connect
     connectWifi();
@@ -445,6 +469,16 @@ void loop() {
     }
 
     mqtt.loop();
+
+    // Auto-revert ON → AUTO when schedule starts
+    if (currentMode == MODE_ON && autoRevertToAuto && timeSynced && isInSchedule()) {
+        currentMode = MODE_AUTO;
+        autoRevertToAuto = false;
+        saveMode();
+        saveAutoRevert();
+        Serial.println("Auto-reverted from ON to AUTO (schedule started)");
+        if (mqtt.connected()) publishModeState();
+    }
 
     // Evaluate desired relay state
     bool desiredRelay = false;
