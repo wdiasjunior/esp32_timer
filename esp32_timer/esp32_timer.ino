@@ -2,6 +2,8 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <time.h>
 #include "config.h"
 
@@ -25,6 +27,8 @@ struct TimeRange {
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
 Preferences  prefs;
+OneWire      oneWire(TEMP_SENSOR_PIN);
+DallasTemperature tempSensor(&oneWire);
 
 Mode      currentMode        = MODE_OFF;
 bool      relayState         = false;
@@ -33,9 +37,14 @@ bool      autoRevertToAuto   = false; // ON set outside schedule → revert to A
 uint8_t   scheduleCount      = 0;
 TimeRange schedules[MAX_SCHEDULES];
 
+float currentTemp     = -127.0;
+float tempLimit       = DEFAULT_TEMP_LIMIT;
+bool  tempSensorValid = false;
+
 unsigned long lastStatePublish = 0;
 unsigned long lastWifiAttempt  = 0;
 unsigned long lastMqttAttempt  = 0;
+unsigned long lastTempRead     = 0;
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -98,6 +107,47 @@ void loadAutoRevert() {
     prefs.begin("timer", true);
     autoRevertToAuto = prefs.getBool("autoRev", false);
     prefs.end();
+}
+
+void saveTempLimit() {
+    prefs.begin("timer", false);
+    prefs.putFloat("tempLim", tempLimit);
+    prefs.end();
+}
+
+void loadTempLimit() {
+    prefs.begin("timer", true);
+    tempLimit = prefs.getFloat("tempLim", DEFAULT_TEMP_LIMIT);
+    prefs.end();
+}
+
+// ---------------------------------------------------------------------------
+// Temperature sensor
+// ---------------------------------------------------------------------------
+
+void readTemperature() {
+    tempSensor.requestTemperatures();
+    float temp = tempSensor.getTempCByIndex(0);
+
+    if (temp == DEVICE_DISCONNECTED_C) {
+        if (tempSensorValid) {
+            Serial.println("Temperature sensor disconnected!");
+            tempSensorValid = false;
+        }
+        return;
+    }
+
+    currentTemp = temp;
+    if (!tempSensorValid) {
+        tempSensorValid = true;
+        Serial.println("Temperature sensor connected");
+    }
+
+    if (mqtt.connected()) {
+        char buf[8];
+        dtostrf(currentTemp, 1, 1, buf);
+        mqtt.publish(TOPIC_TEMP_STATE, buf, true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +222,17 @@ bool parseScheduleJson(const char* json) {
 
     scheduleCount = count;
     memcpy(schedules, temp, sizeof(TimeRange) * count);
+
+    // Optional temp_limit in the same payload
+    if (doc.containsKey("temp_limit")) {
+        float tl = doc["temp_limit"];
+        if (tl >= 20.0 && tl <= 80.0) {
+            tempLimit = tl;
+            saveTempLimit();
+            Serial.printf("Temp limit updated to %.1f°C\n", tempLimit);
+        }
+    }
+
     return true;
 }
 
@@ -227,10 +288,26 @@ void publishScheduleState() {
     mqtt.publish(TOPIC_SCHED_STATE, s.c_str(), true);
 }
 
+void publishTemperature() {
+    if (tempSensorValid) {
+        char buf[8];
+        dtostrf(currentTemp, 1, 1, buf);
+        mqtt.publish(TOPIC_TEMP_STATE, buf, true);
+    }
+}
+
+void publishTempLimit() {
+    char buf[8];
+    dtostrf(tempLimit, 1, 1, buf);
+    mqtt.publish(TOPIC_TEMP_LIMIT_STATE, buf, true);
+}
+
 void publishAllState() {
     publishModeState();
     publishRelayState();
     publishScheduleState();
+    publishTemperature();
+    publishTempLimit();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +369,38 @@ void publishDiscovery() {
         mqtt.publish("homeassistant/sensor/" DEVICE_ID "/schedule/config", buf, true);
     }
 
+    // 4) Temperature sensor
+    {
+        JsonDocument doc;
+        doc["name"]       = "Temperature";
+        doc["uniq_id"]    = DEVICE_ID "_temperature";
+        doc["stat_t"]     = TOPIC_TEMP_STATE;
+        doc["avty_t"]     = TOPIC_AVAILABILITY;
+        doc["dev_cla"]    = "temperature";
+        doc["unit_of_meas"] = "\u00b0C";
+        addDevice(doc["dev"].to<JsonObject>());
+        serializeJson(doc, buf);
+        mqtt.publish("homeassistant/sensor/" DEVICE_ID "/temperature/config", buf, true);
+    }
+
+    // 5) Temperature limit (number slider)
+    {
+        JsonDocument doc;
+        doc["name"]       = "Temp Limit";
+        doc["uniq_id"]    = DEVICE_ID "_temp_limit";
+        doc["cmd_t"]      = TOPIC_TEMP_LIMIT_SET;
+        doc["stat_t"]     = TOPIC_TEMP_LIMIT_STATE;
+        doc["avty_t"]     = TOPIC_AVAILABILITY;
+        doc["min"]        = 20;
+        doc["max"]        = 80;
+        doc["step"]       = 0.5;
+        doc["unit_of_meas"] = "\u00b0C";
+        doc["ic"]         = "mdi:thermometer-alert";
+        addDevice(doc["dev"].to<JsonObject>());
+        serializeJson(doc, buf);
+        mqtt.publish("homeassistant/number/" DEVICE_ID "/temp_limit/config", buf, true);
+    }
+
     Serial.println("HA discovery published");
 }
 
@@ -332,6 +441,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             Serial.printf("Schedule updated: %s\n", scheduleToString().c_str());
         }
         publishScheduleState();
+        publishTempLimit();
+    }
+    else if (strcmp(topic, TOPIC_TEMP_LIMIT_SET) == 0) {
+        float tl = atof(msg);
+        if (tl >= 20.0 && tl <= 80.0) {
+            tempLimit = tl;
+            saveTempLimit();
+            Serial.printf("Temp limit changed to %.1f°C\n", tempLimit);
+        }
+        publishTempLimit();
     }
 }
 
@@ -404,6 +523,7 @@ void connectMqtt() {
         Serial.println(" connected");
         mqtt.subscribe(TOPIC_MODE_SET);
         mqtt.subscribe(TOPIC_SCHED_SET);
+        mqtt.subscribe(TOPIC_TEMP_LIMIT_SET);
         mqtt.publish(TOPIC_AVAILABILITY, "online", true);
         publishDiscovery();
         publishAllState();
@@ -427,12 +547,18 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH); // LED on during boot
 
+    // Temperature sensor
+    tempSensor.begin();
+    tempSensor.setResolution(12);
+
     // Load saved state
     loadMode();
     loadSchedules();
     loadAutoRevert();
-    Serial.printf("Loaded mode: %s, schedules: %s, autoRevert: %d\n",
-                  modeToString(currentMode), scheduleToString().c_str(), autoRevertToAuto);
+    loadTempLimit();
+    Serial.printf("Loaded mode: %s, schedules: %s, autoRevert: %d, temp limit: %.1f°C\n",
+                  modeToString(currentMode), scheduleToString().c_str(),
+                  autoRevertToAuto, tempLimit);
 
     // Connect
     connectWifi();
@@ -480,12 +606,34 @@ void loop() {
         if (mqtt.connected()) publishModeState();
     }
 
+    if (millis() - lastTempRead > TEMP_READ_INTERVAL) {
+        lastTempRead = millis();
+        readTemperature();
+    }
+
     // Evaluate desired relay state
     bool desiredRelay = false;
     switch (currentMode) {
-        case MODE_OFF:  desiredRelay = false; break;
-        case MODE_ON:   desiredRelay = true;  break;
-        case MODE_AUTO: desiredRelay = isInSchedule(); break;
+        case MODE_OFF:
+            desiredRelay = false;
+            break;
+        case MODE_ON:
+            desiredRelay = true;
+            break;
+        case MODE_AUTO:
+            if (!isInSchedule()) {
+                desiredRelay = false;
+            } else if (!tempSensorValid) {
+                // Sensor failed — let the boiler's manual thermostat handle it
+                desiredRelay = true;
+            } else if (relayState) {
+                // Currently heating — keep on until temp reaches limit
+                desiredRelay = currentTemp < tempLimit;
+            } else {
+                // Currently off — turn back on when temp drops below (limit - hysteresis)
+                desiredRelay = currentTemp < (tempLimit - TEMP_HYSTERESIS);
+            }
+            break;
     }
 
     if (desiredRelay != relayState) {

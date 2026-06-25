@@ -12,10 +12,6 @@ Disclaimer: this was completely vibe coded and I don't really care about whether
 - **Persistent state**: Mode and schedules survive reboots (stored in flash)
 - **Standalone operation**: Keeps running in last mode even if Home Assistant is down
 
-## TODO
-
-- [ ] Add a temperature sensor.
-
 ## Hardware
 
 - ESP32-C3 Super Mini
