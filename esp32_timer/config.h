@@ -37,6 +37,11 @@
 #define RELAY_MIN_ON_MS    60000  // (ms)
 #define RELAY_MIN_OFF_MS   60000  // (ms)
 
+// --- OTA updates ---
+#define OTA_HOSTNAME          "relay-timer-01" // mDNS/DHCP name: relay-timer-01.local
+#define OTA_PASSWORD          "change-me"      // Password for IDE/CLI network uploads. Empty string disables auth (not recommended).
+#define OTA_VERIFY_TIMEOUT_MS 600000           // After an update, if MQTT hasn't connected within this time, reboot -> bootloader rolls back
+
 // --- NTP ---
 #define NTP_SERVER     "pool.ntp.org"
 #define GMT_OFFSET_SEC -10800 // UTC-3 (Brazil)
@@ -57,3 +62,7 @@
 #define TOPIC_TEMP_LIMIT_STATE MQTT_PREFIX "/temp_limit/state"
 #define TOPIC_TEMP_LIMIT_SET   MQTT_PREFIX "/temp_limit/set"
 #define TOPIC_TEMP_FAULT_STATE MQTT_PREFIX "/temp_fault/state"
+#define TOPIC_OTA_STATE        MQTT_PREFIX "/ota/state"   // JSON for the HA update entity
+#define TOPIC_OTA_SET          MQTT_PREFIX "/ota/set"     // "install" or an http:// URL (never publish retained!)
+#define TOPIC_OTA_LATEST       MQTT_PREFIX "/ota/latest"  // retained JSON {"version":"x.y.z","url":"http://..."}
+#define TOPIC_OTA_STATUS       MQTT_PREFIX "/ota/status"  // human-readable last OTA status
