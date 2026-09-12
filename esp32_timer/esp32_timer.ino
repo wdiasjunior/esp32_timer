@@ -41,10 +41,23 @@ float currentTemp     = -127.0;
 float tempLimit       = DEFAULT_TEMP_LIMIT;
 bool  tempSensorValid = false;
 
-unsigned long lastStatePublish = 0;
-unsigned long lastWifiAttempt  = 0;
-unsigned long lastMqttAttempt  = 0;
-unsigned long lastTempRead     = 0;
+DeviceAddress tempAddr;                       // resolved once, re-resolved after a fault
+bool          tempAddrKnown         = false;
+bool          tempConversionPending = false;  // conversion requested, result not read yet
+uint8_t       tempFailCount         = 0;      // consecutive bad reads
+bool          tempDistrust85        = false;  // reject one 85.0 (power-on value) after discovery
+float         lastPublishedTemp     = NAN;
+
+bool prevHeatGate = false;    // last evaluated "heating permitted by mode/schedule"
+Mode prevEvalMode = MODE_OFF; // mode seen at last relay evaluation
+
+unsigned long lastStatePublish     = 0;
+unsigned long lastWifiAttempt      = 0;
+unsigned long lastMqttAttempt      = 0;
+unsigned long lastTempRead         = 0;
+unsigned long tempConversionStart  = 0;
+unsigned long lastGoodTempRead     = 0;
+unsigned long lastRelayChange      = 0;
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -115,39 +128,168 @@ void saveTempLimit() {
     prefs.end();
 }
 
+// Single validation path for every source of a new limit (HA number, schedule JSON, NVS).
+bool applyTempLimit(float tl, bool persist) {
+    if (isnan(tl) || tl < TEMP_LIMIT_MIN || tl > TEMP_LIMIT_MAX) return false;
+    tempLimit = tl;
+    if (persist) saveTempLimit();
+    return true;
+}
+
 void loadTempLimit() {
     prefs.begin("timer", true);
-    tempLimit = prefs.getFloat("tempLim", DEFAULT_TEMP_LIMIT);
+    float stored = prefs.getFloat("tempLim", DEFAULT_TEMP_LIMIT);
     prefs.end();
+    if (!applyTempLimit(stored, false)) {
+        Serial.printf("Stored temp limit %.1f out of range, using default\n", stored);
+        tempLimit = DEFAULT_TEMP_LIMIT;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Temperature sensor
 // ---------------------------------------------------------------------------
 
-void readTemperature() {
-    tempSensor.requestTemperatures();
-    float temp = tempSensor.getTempCByIndex(0);
+void publishTemperature();
+void publishTempFault();
 
-    if (temp == DEVICE_DISCONNECTED_C) {
-        if (tempSensorValid) {
-            Serial.println("Temperature sensor disconnected!");
-            tempSensorValid = false;
-        }
-        return;
+// Conversion time for the configured resolution, plus a little margin.
+unsigned long tempConversionMs() {
+    switch (TEMP_RESOLUTION) {
+        case 9:  return 94  + 20;
+        case 10: return 188 + 20;
+        case 11: return 375 + 20;
+        default: return 750 + 20;
     }
+}
 
-    currentTemp = temp;
-    if (!tempSensorValid) {
+void tempReadFailed() {
+    if (tempFailCount < 255) tempFailCount++;
+    if (!tempSensorValid) return;
+
+    bool tooMany = tempFailCount >= TEMP_FAIL_COUNT;
+    bool stale   = millis() - lastGoodTempRead > TEMP_STALE_MS;
+    if (tooMany || stale) {
+        tempSensorValid = false;
+        tempAddrKnown   = false; // re-search the bus on recovery (sensor may have been swapped)
+        Serial.printf("Temperature sensor disconnected! (%u consecutive failures)\n", tempFailCount);
+        if (mqtt.connected()) {
+            publishTemperature(); // publishes "None" -> HA shows unknown
+            publishTempFault();
+        }
+    }
+}
+
+void tempReadOk(float temp) {
+    tempFailCount    = 0;
+    lastGoodTempRead = millis();
+    currentTemp      = temp;
+
+    bool justRecovered = !tempSensorValid;
+    if (justRecovered) {
         tempSensorValid = true;
         Serial.println("Temperature sensor connected");
     }
 
     if (mqtt.connected()) {
-        char buf[8];
-        dtostrf(currentTemp, 1, 1, buf);
-        mqtt.publish(TOPIC_TEMP_STATE, buf, true);
+        if (justRecovered) publishTempFault();
+        if (isnan(lastPublishedTemp) || fabsf(temp - lastPublishedTemp) >= TEMP_PUBLISH_DELTA) {
+            publishTemperature();
+        }
     }
+}
+
+// Phase 1: find the sensor if needed and kick off a conversion (non-blocking).
+void startTempConversion() {
+    lastTempRead = millis();
+
+    if (!tempAddrKnown) {
+        if (!tempSensor.getAddress(tempAddr, 0)) {
+            tempReadFailed();
+            return;
+        }
+        tempAddrKnown  = true;
+        tempDistrust85 = true;
+        tempSensor.setResolution(tempAddr, TEMP_RESOLUTION);
+        Serial.print("DS18B20 found at ");
+        for (uint8_t i = 0; i < 8; i++) Serial.printf("%02X", tempAddr[i]);
+        Serial.println();
+    }
+
+    tempSensor.requestTemperaturesByAddress(tempAddr);
+    tempConversionPending = true;
+    tempConversionStart   = millis();
+}
+
+// Phase 2: once the conversion time has elapsed, read and validate the result.
+void finishTempConversion() {
+    tempConversionPending = false;
+    float temp = tempSensor.getTempC(tempAddr);
+
+    // -127 = no response / CRC error. Out-of-datasheet values are bus noise.
+    // Exactly 85.0 is the DS18B20 power-on value: reject it once right after (re)discovery,
+    // then accept it, so a genuinely 85 °C tank is still measured (and stays above the limit).
+    bool powerOnValue = (temp == 85.0f) && tempDistrust85;
+    tempDistrust85 = false;
+    bool bad = (temp == DEVICE_DISCONNECTED_C) || temp < -55.0f || temp > 125.0f || powerOnValue;
+
+    if (bad) tempReadFailed();
+    else     tempReadOk(temp);
+}
+
+// Called every loop pass. Never blocks the loop for more than a bus transaction.
+void serviceTemperature() {
+    unsigned long now = millis();
+    if (tempConversionPending) {
+        if (now - tempConversionStart >= tempConversionMs()) finishTempConversion();
+    } else if (now - lastTempRead >= TEMP_READ_INTERVAL) {
+        startTempConversion();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relay control (thermostat + dwell protection)
+// ---------------------------------------------------------------------------
+
+bool isInSchedule();
+const char* modeToString(Mode m);
+
+// Thermostat with hysteresis. Sensor fault => heat, and let the boiler's own
+// mechanical thermostat be the cap (debounced in tempReadFailed()).
+bool thermostatWantsHeat() {
+    if (!tempSensorValid) return true;
+    if (relayState) return currentTemp < tempLimit;                     // keep heating until limit
+    return currentTemp < (tempLimit - TEMP_HYSTERESIS);                 // resume below limit - hysteresis
+}
+
+// OFF  -> relay off
+// ON   -> schedule override: heat regardless of time, still capped by the temp limit
+// AUTO -> heat only inside a schedule window, capped by the temp limit
+void evaluateRelay() {
+    bool heatGate = (currentMode == MODE_ON) ||
+                    (currentMode == MODE_AUTO && isInSchedule());
+    bool desired  = heatGate && thermostatWantsHeat();
+
+    // A change caused by the mode or the schedule window applies immediately.
+    // A change caused only by temperature (or sensor validity) respects the dwell times,
+    // so a noisy sensor cannot short-cycle the boiler.
+    bool immediate = (currentMode != prevEvalMode) || (heatGate != prevHeatGate);
+    prevEvalMode = currentMode;
+    prevHeatGate = heatGate;
+
+    if (desired == relayState) return;
+
+    if (!immediate) {
+        unsigned long minDwell = relayState ? RELAY_MIN_ON_MS : RELAY_MIN_OFF_MS;
+        if (millis() - lastRelayChange < minDwell) return;
+    }
+
+    setRelay(desired);
+    lastRelayChange = millis();
+    Serial.printf("Relay %s (%s, temp %.1f, limit %.1f)\n",
+                  relayState ? "ON" : "OFF", modeToString(currentMode),
+                  tempSensorValid ? currentTemp : NAN, tempLimit);
+    if (mqtt.connected()) publishRelayState();
 }
 
 // ---------------------------------------------------------------------------
@@ -224,12 +366,12 @@ bool parseScheduleJson(const char* json) {
     memcpy(schedules, temp, sizeof(TimeRange) * count);
 
     // Optional temp_limit in the same payload
-    if (doc.containsKey("temp_limit")) {
-        float tl = doc["temp_limit"];
-        if (tl >= 20.0 && tl <= 80.0) {
-            tempLimit = tl;
-            saveTempLimit();
+    if (doc["temp_limit"].is<float>()) {
+        float tl = doc["temp_limit"].as<float>();
+        if (applyTempLimit(tl, true)) {
             Serial.printf("Temp limit updated to %.1f°C\n", tempLimit);
+        } else {
+            Serial.printf("Temp limit %.1f rejected (range %.0f-%.0f)\n", tl, TEMP_LIMIT_MIN, TEMP_LIMIT_MAX);
         }
     }
 
@@ -293,7 +435,16 @@ void publishTemperature() {
         char buf[8];
         dtostrf(currentTemp, 1, 1, buf);
         mqtt.publish(TOPIC_TEMP_STATE, buf, true);
+        lastPublishedTemp = currentTemp;
+    } else {
+        // HA's MQTT sensor maps the literal string "None" to state "unknown"
+        mqtt.publish(TOPIC_TEMP_STATE, "None", true);
+        lastPublishedTemp = NAN;
     }
+}
+
+void publishTempFault() {
+    mqtt.publish(TOPIC_TEMP_FAULT_STATE, tempSensorValid ? "OFF" : "ON", true);
 }
 
 void publishTempLimit() {
@@ -307,6 +458,7 @@ void publishAllState() {
     publishRelayState();
     publishScheduleState();
     publishTemperature();
+    publishTempFault();
     publishTempLimit();
 }
 
@@ -324,7 +476,7 @@ void publishDiscovery() {
         dev["mf"]    = "Custom";
     };
 
-    char buf[512];
+    char buf[640];
 
     // 1) Mode select entity
     {
@@ -377,10 +529,28 @@ void publishDiscovery() {
         doc["stat_t"]     = TOPIC_TEMP_STATE;
         doc["avty_t"]     = TOPIC_AVAILABILITY;
         doc["dev_cla"]    = "temperature";
+        doc["stat_cla"]   = "measurement";
         doc["unit_of_meas"] = "\u00b0C";
+        doc["sug_dsp_prc"] = 1;
         addDevice(doc["dev"].to<JsonObject>());
         serializeJson(doc, buf);
         mqtt.publish("homeassistant/sensor/" DEVICE_ID "/temperature/config", buf, true);
+    }
+
+    // 4b) Temperature sensor fault (diagnostic)
+    {
+        JsonDocument doc;
+        doc["name"]       = "Temp Sensor Fault";
+        doc["uniq_id"]    = DEVICE_ID "_temp_fault";
+        doc["stat_t"]     = TOPIC_TEMP_FAULT_STATE;
+        doc["avty_t"]     = TOPIC_AVAILABILITY;
+        doc["pl_on"]      = "ON";
+        doc["pl_off"]     = "OFF";
+        doc["dev_cla"]    = "problem";
+        doc["ent_cat"]    = "diagnostic";
+        addDevice(doc["dev"].to<JsonObject>());
+        serializeJson(doc, buf);
+        mqtt.publish("homeassistant/binary_sensor/" DEVICE_ID "/temp_fault/config", buf, true);
     }
 
     // 5) Temperature limit (number slider)
@@ -391,9 +561,10 @@ void publishDiscovery() {
         doc["cmd_t"]      = TOPIC_TEMP_LIMIT_SET;
         doc["stat_t"]     = TOPIC_TEMP_LIMIT_STATE;
         doc["avty_t"]     = TOPIC_AVAILABILITY;
-        doc["min"]        = 20;
-        doc["max"]        = 80;
+        doc["min"]        = TEMP_LIMIT_MIN;
+        doc["max"]        = TEMP_LIMIT_MAX;
         doc["step"]       = 0.5;
+        doc["dev_cla"]    = "temperature";
         doc["unit_of_meas"] = "\u00b0C";
         doc["ic"]         = "mdi:thermometer-alert";
         addDevice(doc["dev"].to<JsonObject>());
@@ -445,10 +616,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     else if (strcmp(topic, TOPIC_TEMP_LIMIT_SET) == 0) {
         float tl = atof(msg);
-        if (tl >= 20.0 && tl <= 80.0) {
-            tempLimit = tl;
-            saveTempLimit();
+        if (applyTempLimit(tl, true)) {
             Serial.printf("Temp limit changed to %.1f°C\n", tempLimit);
+        } else {
+            Serial.printf("Temp limit '%s' rejected (range %.0f-%.0f)\n", msg, TEMP_LIMIT_MIN, TEMP_LIMIT_MAX);
         }
         publishTempLimit();
     }
@@ -547,9 +718,9 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH); // LED on during boot
 
-    // Temperature sensor
+    // Temperature sensor: non-blocking conversions, address resolved on first use
     tempSensor.begin();
-    tempSensor.setResolution(12);
+    tempSensor.setWaitForConversion(false);
 
     // Load saved state
     loadMode();
@@ -566,6 +737,16 @@ void setup() {
         syncNtp();
         connectMqtt();
     }
+
+    // Prime one temperature reading so the first relay evaluation has real data
+    // (otherwise AUTO/ON would briefly force the relay on under the "sensor invalid" rule).
+    startTempConversion();
+    if (tempConversionPending) {
+        delay(tempConversionMs());
+        finishTempConversion();
+    }
+    Serial.printf("Initial temperature: %s\n",
+                  tempSensorValid ? String(currentTemp, 1).c_str() : "sensor not found");
 
     digitalWrite(LED_PIN, LOW); // LED off when ready
 }
@@ -606,41 +787,8 @@ void loop() {
         if (mqtt.connected()) publishModeState();
     }
 
-    if (millis() - lastTempRead > TEMP_READ_INTERVAL) {
-        lastTempRead = millis();
-        readTemperature();
-    }
-
-    // Evaluate desired relay state
-    bool desiredRelay = false;
-    switch (currentMode) {
-        case MODE_OFF:
-            desiredRelay = false;
-            break;
-        case MODE_ON:
-            desiredRelay = true;
-            break;
-        case MODE_AUTO:
-            if (!isInSchedule()) {
-                desiredRelay = false;
-            } else if (!tempSensorValid) {
-                // Sensor failed — let the boiler's manual thermostat handle it
-                desiredRelay = true;
-            } else if (relayState) {
-                // Currently heating — keep on until temp reaches limit
-                desiredRelay = currentTemp < tempLimit;
-            } else {
-                // Currently off — turn back on when temp drops below (limit - hysteresis)
-                desiredRelay = currentTemp < (tempLimit - TEMP_HYSTERESIS);
-            }
-            break;
-    }
-
-    if (desiredRelay != relayState) {
-        setRelay(desiredRelay);
-        Serial.printf("Relay %s\n", relayState ? "ON" : "OFF");
-        if (mqtt.connected()) publishRelayState();
-    }
+    serviceTemperature();
+    evaluateRelay();
 
     // Periodic state re-publish
     if (mqtt.connected() && millis() - lastStatePublish > 60000) {
