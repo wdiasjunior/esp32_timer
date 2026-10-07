@@ -42,6 +42,11 @@
 #define OTA_PASSWORD          "change-me"      // Password for IDE/CLI network uploads. Empty string disables auth (not recommended).
 #define OTA_VERIFY_TIMEOUT_MS 600000           // After an update, if MQTT hasn't connected within this time, reboot -> bootloader rolls back
 
+// --- Resilience / diagnostics ---
+#define NET_WIFI_RESET_MS   300000   // Wi-Fi reports connected but no MQTT for this long -> re-associate Wi-Fi once
+#define NET_REBOOT_MS       1800000  // No MQTT for this long -> reboot the board (relay comes up OFF, then re-evaluates)
+#define LOOP_WDT_TIMEOUT_MS 120000   // Main loop stalls this long -> watchdog reset with a core dump
+
 // --- NTP ---
 #define NTP_SERVER     "pool.ntp.org"
 #define GMT_OFFSET_SEC -10800 // UTC-3 (Brazil)
@@ -66,3 +71,10 @@
 #define TOPIC_OTA_SET          MQTT_PREFIX "/ota/set"     // "install" or an http:// URL (never publish retained!)
 #define TOPIC_OTA_LATEST       MQTT_PREFIX "/ota/latest"  // retained JSON {"version":"x.y.z","url":"http://..."}
 #define TOPIC_OTA_STATUS       MQTT_PREFIX "/ota/status"  // human-readable last OTA status
+#define TOPIC_DIAG_RESET_REASON MQTT_PREFIX "/diag/reset_reason"
+#define TOPIC_DIAG_BOOT_COUNT   MQTT_PREFIX "/diag/boot_count"
+#define TOPIC_DIAG_UPTIME       MQTT_PREFIX "/diag/uptime"
+#define TOPIC_DIAG_HEAP         MQTT_PREFIX "/diag/heap"
+#define TOPIC_DIAG_RSSI         MQTT_PREFIX "/diag/rssi"
+#define TOPIC_DIAG_LAST_CRASH   MQTT_PREFIX "/diag/last_crash"
+#define TOPIC_DIAG_CLOCK        MQTT_PREFIX "/diag/clock_synced"

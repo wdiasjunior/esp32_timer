@@ -15,6 +15,8 @@ Disclaimer: this was completely vibe coded and I don't really care about whether
 - **Temperature limit**: DS18B20 thermostat with hysteresis (default 45 °C, back on 2 °C below), adjustable from a slider in Home Assistant
 - **Relay protection**: temperature-driven switching respects a minimum on/off time (default 60 s) so a noisy sensor can't short-cycle the boiler
 - **Sensor fault handling**: after 3 consecutive bad reads the sensor is declared faulty, HA shows the temperature as unknown and a "Temp Sensor Fault" diagnostic turns on. While faulty, the relay is **kept ON** inside the heating window so the boiler's own mechanical thermostat takes over. Change `thermostatWantsHeat()` if you'd rather fail OFF.
+- **Self-healing**: re-associates Wi-Fi after 5 min without the broker, reboots after 30 min, and a 2-minute loop watchdog resets a stuck board. The clock keeps syncing in the background, so a reboot during an internet outage no longer leaves AUTO dead.
+- **Diagnostics in HA**: reset reason, boot count, uptime, free heap, Wi-Fi RSSI, clock-synced flag and a summary of the last crash, so an outage can be diagnosed without a ladder
 - **OTA updates**: flash new firmware over Wi-Fi from the Arduino IDE/CLI or with one click from Home Assistant, with automatic rollback if the new build can't reach MQTT
 - **MQTT Discovery**: Device auto-registers in Home Assistant — no manual YAML needed
 - **Persistent state**: Mode, schedules and temperature limit survive reboots (stored in flash)
@@ -26,6 +28,16 @@ Disclaimer: this was completely vibe coded and I don't really care about whether
 - Arduino relay shield (single relay)
 - DS18B20 temperature sensor (waterproof probe) on GPIO2, with a **4.7 kΩ pull-up** between the data line and 3.3 V.
   The pull-up is mandatory: GPIO2 is a strapping pin on the ESP32-C3 and must read high at boot, and the 1-Wire bus needs it anyway.
+
+### Power and relay — read this before mounting it out of reach
+
+- **Relay rating vs. load.** The usual Arduino relay shield has 10 A contacts. A 220 V boiler at 2–5 kW draws 9–23 A (double that at 127 V).
+  Breaking such a current arcs the contacts every time; eventually they weld (boiler stuck ON, only its own thermostat left) or burn.
+  If the heater draws more than ~7 A, let the relay drive a proper **contactor** and let the contactor switch the heater.
+- **Power the board from a different circuit than the boiler.** When the relay cuts the heater, the transient on that circuit can sag a
+  cheap USB adapter enough to brown-out reset the ESP32, and a tripped breaker takes the board down with the heater. A dedicated
+  5 V/1 A adapter on another outlet, a short USB cable, and a 470–1000 µF capacitor across 5 V near the board go a long way.
+- An RC snubber or MOV across the relay contacts and keeping the sensor cable away from the mains cable reduce the transients further.
 
 ## Setup
 
@@ -84,6 +96,8 @@ You should see a **Relay Timer** device with these entities:
 - **Temp Sensor Fault** — diagnostic binary sensor, on while the DS18B20 is not responding
 - **Firmware** — update entity showing the installed version, with an **Install** button (see OTA below)
 - **OTA Status** — diagnostic text with the result of the last update
+- Diagnostics (device page → Diagnostic section): **Reset Reason**, **Boot Count**, **Uptime**, **Free Heap**, **Wi-Fi RSSI**,
+  **Clock Synced**, **Last Crash**
 
 ### 6. Optional: Dashboard card
 
@@ -198,6 +212,27 @@ or can't join Wi-Fi — the board reboots and the bootloader falls back to the p
 What rollback cannot save you from: a build that connects to MQTT fine but has a logic bug. Test on the bench first when you
 change anything around the relay.
 
+## When the device shows as "unavailable"
+
+"Unavailable" means the broker delivered the board's last-will: the TCP session dropped and the board has not re-announced itself.
+In order:
+
+1. **Is the boiler still heating with the board dark?** Welded relay contacts. Cut the boiler breaker.
+2. **Check the breaker / RCD** of the board's supply (and of the boiler, if shared). Resetting it also power-cycles the board.
+3. **Power-cycle the board** if you can reach its supply. It should be back in HA within a minute. The firmware itself reboots
+   after 30 minutes without the broker, so a transient network problem clears on its own.
+4. **Read the diagnostics once it is back**: *Reset Reason* tells you why it last booted (`POWERON` = lost power, `BROWNOUT` =
+   supply sagged, `PANIC`/`TASK_WDT` = firmware crash, `SW` = self-reboot or OTA). *Last Crash* carries the crashing task, the
+   program counter and its return address, e.g. `boot #41: task=loopTask pc=0x4200a1b2 ra=0x42001234 mcause=5 mtval=0x00000000`
+   (`mcause` 5/7 = bad load/store address, 2 = illegal instruction; `mtval` is the offending address).
+   To map `pc` and `ra` to source lines, export the build (**Sketch → Export Compiled Binary** also writes the `.elf`) and run:
+   ```bash
+   ~/.arduino15/packages/esp32/tools/riscv32-esp-elf-gcc/*/bin/riscv32-esp-elf-addr2line \
+       -pfiaC -e esp32_timer/build/esp32.esp32.esp32c3/esp32_timer.ino.elf 0x4200a1b2 0x42001234
+   ```
+   The `.elf` must be from the exact build that crashed, so keep the exported build of whatever is installed.
+5. If it never comes back after a power-cycle: bring it down, serial monitor at 115200, read the boot log.
+
 ## MQTT Topics
 
 | Topic | Direction | Purpose |
@@ -216,3 +251,10 @@ change anything around the relay.
 | `esp32timer/relay_timer_01/ota/latest` | HA → Device (retained) | `{"version":"x.y.z","url":"http://…bin"}` describing the newest build |
 | `esp32timer/relay_timer_01/ota/set` | HA → Device | `install` or an `http://` URL to flash (do not retain) |
 | `esp32timer/relay_timer_01/ota/status` | Device → HA | Human-readable result of the last update |
+| `esp32timer/relay_timer_01/diag/reset_reason` | Device → HA | Why the board last booted (`POWERON`, `BROWNOUT`, `PANIC`, `TASK_WDT`, `SW`, …) |
+| `esp32timer/relay_timer_01/diag/boot_count` | Device → HA | Boots since first flash (stored in flash) |
+| `esp32timer/relay_timer_01/diag/uptime` | Device → HA | Seconds since boot |
+| `esp32timer/relay_timer_01/diag/heap` | Device → HA | Free heap in bytes |
+| `esp32timer/relay_timer_01/diag/rssi` | Device → HA | Wi-Fi signal in dBm |
+| `esp32timer/relay_timer_01/diag/clock_synced` | Device → HA | `ON` once NTP has set the clock (AUTO needs this) |
+| `esp32timer/relay_timer_01/diag/last_crash` | Device → HA | Summary of the last core dump, if any |

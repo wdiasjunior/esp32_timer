@@ -8,11 +8,15 @@
 #include <ArduinoOTA.h>
 #include <HTTPUpdate.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
+#include <esp_core_dump.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include "config.h"
 
 // Bump this on every release. Shown in HA (device page + Firmware update entity)
 // and compared against the version published on the ota/latest topic.
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.2.0"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,6 +80,14 @@ bool          otaPendingVerify     = false;  // running a freshly flashed image,
 bool          otaArduinoBegun      = false;
 int           otaLastPct           = -1;
 unsigned long otaBootMillis        = 0;
+
+// Diagnostics / resilience
+uint32_t      bootCount           = 0;
+char          resetReasonStr[24]  = "UNKNOWN";
+char          lastCrash[192]      = "";     // summary of a core dump found at boot (kept until next crash)
+bool          ntpStarted          = false;
+unsigned long lastMqttOkMs        = 0;      // last time mqtt.connected() was true
+bool          wifiResetDone       = false;  // one Wi-Fi re-association per MQTT outage
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -270,6 +282,7 @@ void serviceTemperature() {
 // ---------------------------------------------------------------------------
 
 bool isInSchedule();
+bool clockValid();
 const char* modeToString(Mode m);
 
 // Thermostat with hysteresis. Sensor fault => heat, and let the boiler's own
@@ -302,12 +315,18 @@ void evaluateRelay() {
         if (millis() - lastRelayChange < minDwell) return;
     }
 
+    // Publish the new state *before* driving the pin and give the frame a moment to leave.
+    // Switching the boiler load can produce a transient that resets the board; this way HA
+    // still ends up with the correct retained relay state.
+    if (mqtt.connected()) {
+        mqtt.publish(TOPIC_RELAY_STATE, desired ? "ON" : "OFF", true);
+        delay(20);
+    }
     setRelay(desired);
     lastRelayChange = millis();
     Serial.printf("Relay %s (%s, temp %.1f, limit %.1f)\n",
                   relayState ? "ON" : "OFF", modeToString(currentMode),
                   tempSensorValid ? currentTemp : NAN, tempLimit);
-    if (mqtt.connected()) publishRelayState();
 }
 
 // ---------------------------------------------------------------------------
@@ -315,10 +334,11 @@ void evaluateRelay() {
 // ---------------------------------------------------------------------------
 
 bool isInSchedule() {
-    if (!timeSynced) return false;
+    if (!clockValid()) return false;
 
+    time_t t = time(nullptr);
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) return false;
+    localtime_r(&t, &timeinfo);
 
     uint16_t now = timeinfo.tm_hour * 60 + timeinfo.tm_min;
 
@@ -490,6 +510,25 @@ void publishOtaStatus() {
     if (mqtt.connected()) mqtt.publish(TOPIC_OTA_STATUS, otaStatus, true);
 }
 
+void publishClockSynced() {
+    mqtt.publish(TOPIC_DIAG_CLOCK, timeSynced ? "ON" : "OFF", true);
+}
+
+void publishDiagnostics() {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)(esp_timer_get_time() / 1000000ULL));
+    mqtt.publish(TOPIC_DIAG_UPTIME, buf, true);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)ESP.getFreeHeap());
+    mqtt.publish(TOPIC_DIAG_HEAP, buf, true);
+    snprintf(buf, sizeof(buf), "%d", (int)WiFi.RSSI());
+    mqtt.publish(TOPIC_DIAG_RSSI, buf, true);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)bootCount);
+    mqtt.publish(TOPIC_DIAG_BOOT_COUNT, buf, true);
+    mqtt.publish(TOPIC_DIAG_RESET_REASON, resetReasonStr, true);
+    if (lastCrash[0]) mqtt.publish(TOPIC_DIAG_LAST_CRASH, lastCrash, true);
+    publishClockSynced();
+}
+
 void setOtaStatus(const char* msg) {
     strlcpy(otaStatus, msg, sizeof(otaStatus));
     Serial.printf("OTA: %s\n", otaStatus);
@@ -505,6 +544,133 @@ void publishAllState() {
     publishTempLimit();
     publishOtaState(false, 0);
     publishOtaStatus();
+    publishDiagnostics();
+}
+
+// ---------------------------------------------------------------------------
+// Clock (NTP)
+//
+// configTime() only *starts* SNTP; lwIP keeps retrying on its own (DNS failures
+// included), so we never block waiting for it. We just poll whether the system
+// clock holds a plausible date. This matters after a power blip: the ESP boots in
+// seconds, the router's internet comes back a minute later.
+// ---------------------------------------------------------------------------
+
+void startNtp() {
+    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
+    ntpStarted = true;
+    Serial.println("NTP client started");
+}
+
+bool clockValid() {
+    time_t now = time(nullptr);
+    if (now < 1700000000) return false;         // before 2023-11: clock was never set
+    if (!timeSynced) {
+        timeSynced = true;
+        struct tm t;
+        localtime_r(&now, &t);
+        Serial.printf("Clock synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
+        if (mqtt.connected()) publishClockSynced();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: why did we boot, and are we still healthy?
+// ---------------------------------------------------------------------------
+
+const char* resetReasonToString(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:    return "POWERON";
+        case ESP_RST_EXT:        return "EXT";
+        case ESP_RST_SW:         return "SW";
+        case ESP_RST_PANIC:      return "PANIC";
+        case ESP_RST_INT_WDT:    return "INT_WDT";
+        case ESP_RST_TASK_WDT:   return "TASK_WDT";
+        case ESP_RST_WDT:        return "WDT";
+        case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:   return "BROWNOUT";
+        case ESP_RST_SDIO:       return "SDIO";
+        case ESP_RST_USB:        return "USB";
+        case ESP_RST_JTAG:       return "JTAG";
+        case ESP_RST_EFUSE:      return "EFUSE";
+        case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+        default:                 return "UNKNOWN";
+    }
+}
+
+void diagBoot() {
+    strlcpy(resetReasonStr, resetReasonToString(esp_reset_reason()), sizeof(resetReasonStr));
+
+    prefs.begin("timer", false);
+    bootCount = prefs.getUInt("boots", 0) + 1;
+    prefs.putUInt("boots", bootCount);
+    prefs.end();
+
+    // A panic or watchdog trip leaves a core dump in the coredump partition. Summarise it,
+    // publish it, and erase it so the next crash is not masked by this one.
+    if (esp_core_dump_image_check() == ESP_OK) {
+        esp_core_dump_summary_t* sum = (esp_core_dump_summary_t*)calloc(1, sizeof(esp_core_dump_summary_t));
+        if (sum && esp_core_dump_get_summary(sum) == ESP_OK) {
+            // RISC-V cannot unwind on-device; pc + ra give the faulting instruction and its
+            // caller, which addr2line against the matching .elf resolves to source lines.
+            snprintf(lastCrash, sizeof(lastCrash),
+                     "boot #%u: task=%s pc=0x%08x ra=0x%08x mcause=%u mtval=0x%08x",
+                     (unsigned)(bootCount - 1), sum->exc_task, (unsigned)sum->exc_pc,
+                     (unsigned)sum->ex_info.ra, (unsigned)sum->ex_info.mcause,
+                     (unsigned)sum->ex_info.mtval);
+        } else {
+            snprintf(lastCrash, sizeof(lastCrash), "boot #%u: core dump present but unreadable",
+                     (unsigned)(bootCount - 1));
+        }
+        free(sum);
+        esp_core_dump_image_erase();
+    }
+
+    Serial.printf("Boot #%u, reset reason %s\n", (unsigned)bootCount, resetReasonStr);
+    if (lastCrash[0]) Serial.printf("Previous crash: %s\n", lastCrash);
+}
+
+// Main-loop watchdog. The core's task watchdog only watches the IDLE task, so a loop that
+// is logically stuck but still calls delay() would never be reset. Subscribe the loop task:
+// a stall of LOOP_WDT_TIMEOUT_MS panics, writes a core dump, and reboots.
+void setupLoopWatchdog() {
+    esp_task_wdt_config_t cfg = {
+        .timeout_ms     = LOOP_WDT_TIMEOUT_MS,
+        .idle_core_mask = 1,
+        .trigger_panic  = true,
+    };
+    esp_task_wdt_reconfigure(&cfg);
+    esp_task_wdt_add(NULL);
+}
+
+// Self-healing when HA/the broker cannot be reached for a long time.
+void serviceConnectivity() {
+    unsigned long now = millis();
+    if (mqtt.connected()) {
+        lastMqttOkMs  = now;
+        wifiResetDone = false;
+        return;
+    }
+    unsigned long offline = now - lastMqttOkMs;
+
+    // Wi-Fi says "connected" but MQTT has been unreachable for a while: the radio may be in
+    // the known associated-but-deaf state. Re-associate once per outage; the normal
+    // reconnect path in loop() brings it back.
+    if (WiFi.status() == WL_CONNECTED && !wifiResetDone && offline > NET_WIFI_RESET_MS) {
+        wifiResetDone = true;
+        Serial.println("No MQTT for a while with Wi-Fi up: re-associating Wi-Fi");
+        WiFi.disconnect(true);
+    }
+
+    // Still nothing after a long time: reboot. The relay comes up OFF and AUTO/ON re-evaluate
+    // within seconds, so the cost is a short heating pause.
+    if (offline > NET_REBOOT_MS && !otaRequested) {
+        Serial.println("No MQTT for too long: rebooting");
+        delay(100);
+        ESP.restart();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +712,7 @@ void otaConfirmIfPending() {
 }
 
 void otaReportProgress(size_t cur, size_t total) {
+    esp_task_wdt_reset();
     if (total == 0) return;
     int pct = (int)((uint64_t)cur * 100 / total);
     if (pct / 10 != otaLastPct / 10) {
@@ -556,8 +723,11 @@ void otaReportProgress(size_t cur, size_t total) {
 }
 
 void otaBegin(const char* what) {
+    if (mqtt.connected()) {
+        mqtt.publish(TOPIC_RELAY_STATE, "OFF", true);
+        delay(20);
+    }
     setRelay(false); // safe state: the loop is blocked until the update ends
-    if (mqtt.connected()) publishRelayState();
     otaLastPct = -1;
     setOtaStatus(what);
     publishOtaState(true, 0);
@@ -791,6 +961,37 @@ void publishDiscovery() {
         mqtt.publish("homeassistant/sensor/" DEVICE_ID "/ota_status/config", buf, true);
     }
 
+    // 8) Diagnostics
+    auto diagSensor = [&](const char* component, const char* name, const char* idSuffix,
+                          const char* topic, const char* icon, const char* devCla,
+                          const char* unit, const char* statCla) {
+        JsonDocument doc;
+        doc["name"]    = name;
+        char uid[64];
+        snprintf(uid, sizeof(uid), "%s_%s", DEVICE_ID, idSuffix);
+        doc["uniq_id"] = uid;
+        doc["stat_t"]  = topic;
+        doc["avty_t"]  = TOPIC_AVAILABILITY;
+        doc["ent_cat"] = "diagnostic";
+        if (icon)    doc["ic"]           = icon;
+        if (devCla)  doc["dev_cla"]      = devCla;
+        if (unit)    doc["unit_of_meas"] = unit;
+        if (statCla) doc["stat_cla"]     = statCla;
+        if (strcmp(component, "binary_sensor") == 0) { doc["pl_on"] = "ON"; doc["pl_off"] = "OFF"; }
+        addDevice(doc["dev"].to<JsonObject>());
+        serializeJson(doc, buf);
+        char topicBuf[96];
+        snprintf(topicBuf, sizeof(topicBuf), "homeassistant/%s/%s/%s/config", component, DEVICE_ID, idSuffix);
+        mqtt.publish(topicBuf, buf, true);
+    };
+    diagSensor("sensor",        "Reset Reason", "reset_reason", TOPIC_DIAG_RESET_REASON, "mdi:restart",       nullptr,           nullptr, nullptr);
+    diagSensor("sensor",        "Boot Count",   "boot_count",   TOPIC_DIAG_BOOT_COUNT,   "mdi:counter",       nullptr,           nullptr, "total_increasing");
+    diagSensor("sensor",        "Uptime",       "uptime",       TOPIC_DIAG_UPTIME,       "mdi:timer-outline", "duration",        "s",     nullptr);
+    diagSensor("sensor",        "Free Heap",    "heap",         TOPIC_DIAG_HEAP,         "mdi:memory",        "data_size",       "B",     "measurement");
+    diagSensor("sensor",        "Wi-Fi RSSI",   "rssi",         TOPIC_DIAG_RSSI,         nullptr,             "signal_strength", "dBm",   "measurement");
+    diagSensor("sensor",        "Last Crash",   "last_crash",   TOPIC_DIAG_LAST_CRASH,   "mdi:bug",           nullptr,           nullptr, nullptr);
+    diagSensor("binary_sensor", "Clock Synced", "clock_synced", TOPIC_DIAG_CLOCK,        "mdi:clock-check",   nullptr,           nullptr, nullptr);
+
     Serial.println("HA discovery published");
 }
 
@@ -813,7 +1014,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             saveMode();
 
             // Track if ON was set outside schedule for auto-revert
-            if (newMode == MODE_ON && timeSynced && !isInSchedule()) {
+            if (newMode == MODE_ON && clockValid() && !isInSchedule()) {
                 autoRevertToAuto = true;
             } else {
                 autoRevertToAuto = false;
@@ -883,6 +1084,8 @@ void connectWifi() {
     if (WiFi.status() == WL_CONNECTED) return;
 
     Serial.printf("Connecting to Wi-Fi '%s'", WIFI_SSID);
+    WiFi.persistent(false);        // never write credentials to flash on each begin()
+    WiFi.setAutoReconnect(true);
     WiFi.setHostname(OTA_HOSTNAME);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -890,6 +1093,7 @@ void connectWifi() {
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {
         delay(500);
+        esp_task_wdt_reset();
         Serial.print(".");
         digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // blink LED
         attempts++;
@@ -898,33 +1102,9 @@ void connectWifi() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\nWi-Fi connected — IP: %s\n", WiFi.localIP().toString().c_str());
         digitalWrite(LED_PIN, LOW);
+        if (!ntpStarted) startNtp();
     } else {
         Serial.println("\nWi-Fi connection failed, will retry...");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NTP
-// ---------------------------------------------------------------------------
-
-void syncNtp() {
-    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
-    Serial.print("Syncing NTP");
-
-    struct tm timeinfo;
-    int attempts = 0;
-    while (!getLocalTime(&timeinfo) && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-
-    if (getLocalTime(&timeinfo)) {
-        timeSynced = true;
-        Serial.printf("\nTime synced: %02d:%02d:%02d\n",
-                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    } else {
-        Serial.println("\nNTP sync failed, will use schedule when time becomes available");
     }
 }
 
@@ -966,6 +1146,8 @@ void setup() {
     delay(1000);
     Serial.println("\n=== Relay Timer v" FW_VERSION " starting ===");
     otaBootCheck();
+    diagBoot();
+    setupLoopWatchdog();
 
     // GPIO
     pinMode(RELAY_PIN, OUTPUT);
@@ -986,12 +1168,12 @@ void setup() {
                   modeToString(currentMode), scheduleToString().c_str(),
                   autoRevertToAuto, tempLimit);
 
-    // Connect
+    // Connect (NTP is started inside connectWifi and syncs in the background)
     connectWifi();
     if (WiFi.status() == WL_CONNECTED) {
-        syncNtp();
         connectMqtt();
     }
+    lastMqttOkMs = millis(); // start the offline clock now, not at power-on
 
     // Prime one temperature reading so the first relay evaluation has real data
     // (otherwise AUTO/ON would briefly force the relay on under the "sensor invalid" rule).
@@ -1011,14 +1193,13 @@ void setup() {
 // ---------------------------------------------------------------------------
 
 void loop() {
+    esp_task_wdt_reset();
+
     // Reconnect Wi-Fi if needed
     if (WiFi.status() != WL_CONNECTED) {
         if (millis() - lastWifiAttempt > 10000) {
             lastWifiAttempt = millis();
             connectWifi();
-            if (WiFi.status() == WL_CONNECTED && !timeSynced) {
-                syncNtp();
-            }
         }
     }
 
@@ -1031,10 +1212,11 @@ void loop() {
     }
 
     mqtt.loop();
+    serviceConnectivity();
     serviceOta();
 
     // Auto-revert ON → AUTO when schedule starts
-    if (currentMode == MODE_ON && autoRevertToAuto && timeSynced && isInSchedule()) {
+    if (currentMode == MODE_ON && autoRevertToAuto && isInSchedule()) {
         currentMode = MODE_AUTO;
         autoRevertToAuto = false;
         saveMode();
